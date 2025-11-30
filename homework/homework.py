@@ -95,3 +95,163 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import json
+import gzip
+import pickle
+import os
+import pandas as pd
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectKBest, f_regression
+from sklearn.metrics import (
+    precision_score,
+    balanced_accuracy_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+
+
+def read_datasets():
+    train_df = pd.read_csv(
+        "./files/input/train_data.csv.zip", index_col=False, compression="zip"
+    )
+    test_df = pd.read_csv(
+        "./files/input/test_data.csv.zip", index_col=False, compression="zip"
+    )
+    return train_df, test_df
+
+
+def preprocess_dataframe(dataframe):
+    df_copy = dataframe.copy()
+    df_copy = df_copy.rename(columns={"default payment next month": "default"})
+    df_copy = df_copy.drop(columns=["ID"])
+    df_copy = df_copy.loc[df_copy["MARRIAGE"] != 0]
+    df_copy = df_copy.loc[df_copy["EDUCATION"] != 0]
+    df_copy["EDUCATION"] = df_copy["EDUCATION"].apply(lambda val: 4 if val >= 4 else val)
+    df_copy = df_copy.dropna()
+    return df_copy
+
+
+def extract_features_target(dataframe):
+    features = dataframe.drop(columns=["default"])
+    target = dataframe["default"]
+    return features, target
+
+
+def build_model_pipeline():
+    cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+    
+    transformer = ColumnTransformer(
+        transformers=[("cat", OneHotEncoder(), cat_cols)],
+        remainder=MinMaxScaler(),
+    )
+    
+    selector = SelectKBest(score_func=f_regression, k=10)
+    
+    logistic_model = LogisticRegression(max_iter=1000, random_state=42)
+    
+    return Pipeline(
+        [
+            ("preprocessor", transformer),
+            ("feature_selection", selector),
+            ("classifier", logistic_model),
+        ]
+    )
+
+
+def optimize_hyperparameters(pipeline, features_train):
+    hyperparams = {
+        "feature_selection__k": range(1, len(features_train.columns) + 1),
+        "classifier__C": [0.1, 1, 10],
+        "classifier__solver": ["liblinear", "lbfgs"],
+    }
+    
+    grid_search = GridSearchCV(
+        pipeline, 
+        hyperparams, 
+        cv=10, 
+        scoring="balanced_accuracy", 
+        n_jobs=-1, 
+        refit=True
+    )
+    
+    return grid_search
+
+
+def store_model(filepath, model):
+    directory = os.path.dirname(filepath)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    
+    with gzip.open(filepath, "wb") as file:
+        pickle.dump(model, file)
+
+
+def compute_performance_metrics(split_type, true_labels, predicted_labels):
+    metrics_dict = {
+        "type": "metrics",
+        "dataset": split_type,
+        "precision": precision_score(true_labels, predicted_labels, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(true_labels, predicted_labels),
+        "recall": recall_score(true_labels, predicted_labels, zero_division=0),
+        "f1_score": f1_score(true_labels, predicted_labels, zero_division=0),
+    }
+    return metrics_dict
+
+
+def compute_confusion_matrix_dict(split_type, true_labels, predicted_labels):
+    conf_mat = confusion_matrix(true_labels, predicted_labels)
+    return {
+        "type": "cm_matrix",
+        "dataset": split_type,
+        "true_0": {"predicted_0": int(conf_mat[0][0]), "predicted_1": int(conf_mat[0][1])},
+        "true_1": {"predicted_0": int(conf_mat[1][0]), "predicted_1": int(conf_mat[1][1])},
+    }
+
+
+def persist_metrics(metrics_list, filepath):
+    directory = os.path.dirname(filepath)
+    if not os.path.exists(directory):
+        os.makedirs(directory)
+    
+    with open(filepath, "w", encoding="utf-8") as output_file:
+        for metric in metrics_list:
+            output_file.write(json.dumps(metric) + "\n")
+
+
+def main():
+    train_dataset, test_dataset = read_datasets()
+    
+    train_dataset = preprocess_dataframe(train_dataset)
+    test_dataset = preprocess_dataframe(test_dataset)
+    
+    x_train, y_train = extract_features_target(train_dataset)
+    x_test, y_test = extract_features_target(test_dataset)
+    
+    model_pipeline = build_model_pipeline()
+    
+    grid_search_model = optimize_hyperparameters(model_pipeline, x_train)
+    grid_search_model.fit(x_train, y_train)
+    
+    store_model("files/models/model.pkl.gz", grid_search_model)
+    
+    train_predictions = grid_search_model.predict(x_train)
+    test_predictions = grid_search_model.predict(x_test)
+    
+    train_perf = compute_performance_metrics("train", y_train, train_predictions)
+    test_perf = compute_performance_metrics("test", y_test, test_predictions)
+    
+    train_conf_matrix = compute_confusion_matrix_dict("train", y_train, train_predictions)
+    test_conf_matrix = compute_confusion_matrix_dict("test", y_test, test_predictions)
+    
+    all_metrics = [train_perf, test_perf, train_conf_matrix, test_conf_matrix]
+    persist_metrics(all_metrics, "files/output/metrics.json")
+
+
+if __name__ == "__main__":
+    main()
